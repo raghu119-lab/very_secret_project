@@ -224,17 +224,13 @@ details.settings summary{
           <label for="s-name">Your name</label>
           <input type="text" id="s-name" placeholder="Avi" autocomplete="off">
         </div>
-        <div class="field">
-          <label for="s-token">GitHub token</label>
-          <input type="password" id="s-token" placeholder="github_pat_..." autocomplete="off">
-        </div>
         <div class="compose-foot">
-          <button class="btn ghost tiny" id="save-settings">Save settings</button>
-          <button class="btn ghost tiny" id="clear-token">Forget token</button>
+          <button class="btn ghost tiny" id="save-settings">Save name</button>
         </div>
-        <p>The token is what lets this page save changes back to the repo. It stays in this browser only, and is never written into the site. Anyone using the list needs their own.</p>
-        <p>Make one at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Fine-grained tokens</a>: pick only this repository, and under Repository permissions set Contents to Read and write.</p>
-        <p class="eyebrow" id="repo-label"></p>
+        <p>Your name is only stored on this device, and shows next to the things you add.</p>
+        <p>Everything on this page lives in a Google Sheet you both have access to. Add things here, or type straight into the sheet, whichever is easier at the time. Both stay in step.</p>
+        <p><a id="sheet-link" href="#" target="_blank" rel="noopener">Open the sheet</a></p>
+        <p class="eyebrow" id="conn-label"></p>
       </div>
     </details>
 
@@ -245,212 +241,85 @@ details.settings summary{
 <script>
 /* ------------------------------------------------------------------
    CONFIG
-   Leave owner/repo blank to auto-detect from the github.io address.
-   Fill them in if you are opening the file locally or on another host.
+   Paste the two links the setup gives you. Nothing else to edit.
 ------------------------------------------------------------------- */
 var CFG = {
-  owner:  "",                 // e.g. "avyukt"
-  repo:   "",                 // e.g. "bucketlist"
-  branch: "main",
-  path:   "bucketlist.csv"
+  // The web app URL from Apps Script. Ends in /exec
+  endpoint: "",
+  // The normal link to the sheet, used by "Open the sheet" in Settings
+  sheetUrl: ""
 };
-
-var COLUMNS = ["id","place","activity","notes","added_by","done","added_on","stamped_on"];
-
-/* ---------- config detection ---------- */
-(function detect(){
-  if (CFG.owner && CFG.repo) return;
-  var host = location.hostname;                       // name.github.io
-  var m = host.match(/^([^.]+)\.github\.io$/i);
-  if (!m) return;
-  CFG.owner = CFG.owner || m[1];
-  if (!CFG.repo) {
-    var seg = location.pathname.split("/").filter(Boolean)[0];
-    CFG.repo = seg ? seg : host;                      // project page vs user page
-  }
-})();
 
 /* ---------- small helpers ---------- */
 var $ = function(sel){ return document.querySelector(sel); };
-var state = { rows: [], sha: null, filter: "all", busy: false, loaded: false, justStamped: null };
+var state = { rows: [], filter: "all", busy: false, loaded: false, justStamped: null };
 
 function getName(){ return localStorage.getItem("bl.name") || ""; }
-function getToken(){ return localStorage.getItem("bl.token") || ""; }
 
 function status(msg, kind){
   var el = $("#status");
-  if (!msg) { el.className = "status hide"; el.textContent = ""; return; }
+  if (!msg){ el.className = "status hide"; el.textContent = ""; return; }
   el.className = "status" + (kind ? " " + kind : "");
   el.textContent = msg;
 }
 
-function today(){
-  var d = new Date();
-  var p = function(n){ return String(n).padStart(2,"0"); };
-  return d.getFullYear() + "-" + p(d.getMonth()+1) + "-" + p(d.getDate());
+function clearStatusSoon(){
+  setTimeout(function(){
+    if ($("#status").classList.contains("ok")) status("");
+  }, 2200);
 }
 
-/* ---------- CSV ---------- */
-function parseCSV(text){
-  var rows = [], row = [], field = "", i = 0, inQ = false;
-  while (i < text.length){
-    var c = text[i];
-    if (inQ){
-      if (c === '"'){
-        if (text[i+1] === '"'){ field += '"'; i += 2; continue; }
-        inQ = false; i++; continue;
-      }
-      field += c; i++; continue;
-    }
-    if (c === '"'){ inQ = true; i++; continue; }
-    if (c === ','){ row.push(field); field = ""; i++; continue; }
-    if (c === '\r'){ i++; continue; }
-    if (c === '\n'){ row.push(field); rows.push(row); row = []; field = ""; i++; continue; }
-    field += c; i++;
-  }
-  if (field.length || row.length){ row.push(field); rows.push(row); }
-  return rows.filter(function(r){ return !(r.length === 1 && r[0].trim() === ""); });
-}
-
-function fromCSV(text){
-  var grid = parseCSV(text);
-  if (!grid.length) return [];
-  var head = grid[0].map(function(h){ return h.trim().toLowerCase(); });
-  return grid.slice(1).map(function(r){
-    var o = {};
-    head.forEach(function(h, i){ o[h] = (r[i] || "").trim(); });
-    o.done = String(o.done).toLowerCase() === "true";
-    if (!o.id) o.id = newId();
-    return o;
-  });
-}
-
-function esc(v){
-  var s = v === undefined || v === null ? "" : String(v);
-  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
-}
-
-function toCSV(rows){
-  var lines = [COLUMNS.join(",")];
-  rows.forEach(function(r){
-    lines.push(COLUMNS.map(function(c){
-      return esc(c === "done" ? (r.done ? "true" : "false") : r[c]);
-    }).join(","));
-  });
-  return lines.join("\n") + "\n";
-}
-
-function newId(){
-  return Date.now().toString(36) + Math.random().toString(36).slice(2,6);
-}
-
-/* ---------- base64 that survives accents and kanji ---------- */
-function b64encode(str){
-  var bytes = new TextEncoder().encode(str), bin = "";
-  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
-}
-function b64decode(b64){
-  var bin = atob(String(b64).replace(/\s/g,""));
-  var bytes = new Uint8Array(bin.length);
-  for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new TextDecoder().decode(bytes);
-}
-
-/* ---------- GitHub ---------- */
-function apiURL(extra){
-  return "https://api.github.com/repos/" + CFG.owner + "/" + CFG.repo +
-         "/contents/" + CFG.path + (extra || "");
-}
-
-function headers(){
-  var h = {
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28"
-  };
-  if (getToken()) h["Authorization"] = "Bearer " + getToken();
-  return h;
-}
-
+/* ---------- talking to the sheet ---------- */
 async function load(){
-  if (!CFG.owner || !CFG.repo){
-    status("Repository not set. Open index.html and fill in owner and repo at the top of the script.", "err");
+  if (!CFG.endpoint){
+    status("No sheet connected yet. Paste the web app link into CFG.endpoint in index.html.", "err");
     return;
   }
   try {
-    if (getToken()){
-      var res = await fetch(apiURL("?ref=" + CFG.branch + "&nocache=" + Date.now()),
-                            { headers: headers(), cache: "no-store" });
-      if (res.status === 404){ state.rows = []; state.sha = null; state.loaded = true; render(); return; }
-      if (res.status === 401 || res.status === 403){
-        status("GitHub rejected the token. Check it under Settings.", "err"); return;
-      }
-      if (!res.ok) throw new Error("GitHub returned " + res.status);
-      var j = await res.json();
-      state.sha = j.sha;
-      state.rows = fromCSV(b64decode(j.content));
-    } else {
-      var raw = "https://raw.githubusercontent.com/" + CFG.owner + "/" + CFG.repo +
-                "/" + CFG.branch + "/" + CFG.path + "?nocache=" + Date.now();
-      var r2 = await fetch(raw, { cache: "no-store" });
-      if (r2.status === 404){ state.rows = []; state.sha = null; state.loaded = true; render(); return; }
-      if (!r2.ok) throw new Error("Could not read the file (" + r2.status + ")");
-      state.rows = fromCSV(await r2.text());
-      state.sha = null;
-    }
+    var res = await fetch(CFG.endpoint + "?t=" + Date.now(), { cache: "no-store", redirect: "follow" });
+    var data = await res.json();
+    if (!data.ok) throw new Error(data.error || "the sheet refused the request");
+    state.rows = data.items;
     state.loaded = true;
     render();
   } catch (e){
-    status("Could not load the list: " + e.message, "err");
+    status("Could not reach the sheet: " + e.message, "err");
   }
 }
 
-async function put(rows, message){
-  var body = { message: message, content: b64encode(toCSV(rows)), branch: CFG.branch };
-  if (state.sha) body.sha = state.sha;
-  return fetch(apiURL(), { method: "PUT", headers: headers(), body: JSON.stringify(body) });
-}
-
-/* Applies a change, then commits it. If the other person saved first,
-   reloads their version, reapplies the change and tries again. */
-async function commit(transform, message){
-  if (!getToken()){
-    status("Add a GitHub token under Settings to change the list.", "err");
-    $(".settings").open = true;
-    return;
-  }
+/* Apps Script cannot answer a CORS preflight, so this is deliberately kept
+   a "simple" request: text/plain content type and no custom headers. The
+   body is still JSON, the script just parses it itself. */
+async function send(action, payload, note){
   if (state.busy) return;
+  if (!CFG.endpoint){ status("No sheet connected yet.", "err"); return; }
   state.busy = true; render();
-
-  for (var attempt = 0; attempt < 3; attempt++){
-    var next = transform(state.rows.map(function(r){ return Object.assign({}, r); }));
-    var res;
-    try { res = await put(next, message); }
-    catch (e){ state.busy = false; status("Network error: " + e.message, "err"); render(); return; }
-
-    if (res.ok){
-      var j = await res.json();
-      state.sha = j.content.sha;
-      state.rows = next;
-      state.busy = false;
-      status("Saved.", "ok");
-      setTimeout(function(){ status(""); }, 2200);
-      render();
-      return;
-    }
-    if (res.status === 409 || res.status === 422){ await load(); continue; }  // someone else saved
-    if (res.status === 401 || res.status === 403){
-      state.busy = false;
-      status("GitHub rejected the token. It may be expired, or missing Contents write access.", "err");
-      render(); return;
-    }
+  try {
+    var res = await fetch(CFG.endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(Object.assign({ action: action }, payload)),
+      redirect: "follow"
+    });
+    var data = await res.json();
+    if (!data.ok) throw new Error(data.error || "the sheet refused the change");
+    state.rows = data.items;
+    state.loaded = true;
     state.busy = false;
-    status("Save failed (" + res.status + ").", "err");
-    render(); return;
+    status(note || "Saved.", "ok");
+    clearStatusSoon();
+    render();
+  } catch (e){
+    state.busy = false;
+    state.justStamped = null;
+    status("Nothing was saved: " + e.message, "err");
+    render();
   }
-  state.busy = false;
-  status("Kept colliding with another change. Hit Refresh and try again.", "err");
-  render();
+}
+
+function today(){
+  var d = new Date(), p = function(n){ return String(n).padStart(2,"0"); };
+  return d.getFullYear() + "-" + p(d.getMonth()+1) + "-" + p(d.getDate());
 }
 
 /* ---------- actions ---------- */
@@ -460,15 +329,10 @@ function addEntry(){
   var note  = $("#f-note").value.trim();
   if (!place && !act){ status("Give it a place or an activity first.", "err"); return; }
 
-  var entry = {
-    id: newId(), place: place, activity: act, notes: note,
-    added_by: getName(), done: false, added_on: today()
-  };
   $("#f-place").value = ""; $("#f-act").value = ""; $("#f-note").value = "";
   $("#f-place").focus();
 
-  commit(function(rows){ rows.push(entry); return rows; },
-         "Add " + (place || act));
+  send("add", { place: place, activity: act, notes: note, added_by: getName() }, "Added.");
 }
 
 function removeEntry(id){
@@ -476,8 +340,7 @@ function removeEntry(id){
   if (!row) return;
   var label = row.place || row.activity || "this entry";
   if (!confirm("Remove " + label + " from the list?")) return;
-  commit(function(rows){ return rows.filter(function(r){ return r.id !== id; }); },
-         "Remove " + label);
+  send("remove", { id: id }, "Removed.");
 }
 
 function toggleDone(id){
@@ -485,12 +348,8 @@ function toggleDone(id){
   if (!row) return;
   var goingDone = !row.done;
   if (goingDone) state.justStamped = id;
-  commit(function(rows){
-    rows.forEach(function(r){
-      if (r.id === id){ r.done = goingDone; r.stamped_on = goingDone ? today() : ""; }
-    });
-    return rows;
-  }, (goingDone ? "Stamp " : "Unstamp ") + (row.place || row.activity));
+  send("toggle", { id: id, done: goingDone, stamped_on: goingDone ? today() : "" },
+       goingDone ? "Stamped." : "Back on the list.");
 }
 
 /* ---------- render ---------- */
@@ -498,19 +357,19 @@ function render(){
   var open = state.rows.filter(function(r){ return !r.done; }).length;
   var done = state.rows.length - open;
   $("#counts").textContent = state.loaded
-    ? open + " to go  ·  " + done + " stamped"
+    ? open + " to go  \u00b7  " + done + " stamped"
     : "Loading\u2026";
   $("#who-label").textContent = getName() ? "adding as " + getName() : "set your name in settings";
-  $("#repo-label").textContent = CFG.owner && CFG.repo
-      ? "Saving to " + CFG.owner + "/" + CFG.repo + " · " + CFG.path
-      : "Repository not detected";
+  $("#conn-label").textContent = CFG.endpoint ? "Connected to the sheet" : "No sheet connected";
   $("#add-btn").disabled = state.busy;
+  if (CFG.sheetUrl) $("#sheet-link").href = CFG.sheetUrl;
+  else $("#sheet-link").parentNode.style.display = "none";
 
   var list = $("#list");
   list.textContent = "";
 
   var rows = state.rows.slice().sort(function(a,b){
-    if (a.done !== b.done) return a.done ? 1 : -1;
+    if (!a.done !== !b.done) return a.done ? 1 : -1;
     return String(b.added_on || "").localeCompare(String(a.added_on || ""));
   });
   if (state.filter === "open") rows = rows.filter(function(r){ return !r.done; });
@@ -534,7 +393,7 @@ function render(){
     var stub = document.createElement("div");
     stub.className = "stub";
     var initial = document.createElement("span");
-    initial.textContent = (r.added_by || "").trim().slice(0,3).toUpperCase();
+    initial.textContent = String(r.added_by || "").trim().slice(0,3).toUpperCase();
     stub.appendChild(initial);
 
     var body = document.createElement("div");
@@ -577,11 +436,10 @@ function render(){
     if (r.done){
       var pm = document.createElement("div");
       pm.className = "postmark";
-      pm.innerHTML = "";
-      var t = document.createTextNode("VISITED");
       var s = document.createElement("small");
       s.textContent = r.stamped_on || r.added_on || "";
-      pm.appendChild(t); pm.appendChild(s);
+      pm.appendChild(document.createTextNode("VISITED"));
+      pm.appendChild(s);
       tag.appendChild(pm);
       if (state.justStamped === r.id){
         tag.classList.add("stamping");
@@ -609,26 +467,26 @@ document.querySelectorAll(".chip[data-filter]").forEach(function(btn){
     render();
   };
 });
-$("#refresh").onclick = function(){ status("Refreshing\u2026"); load().then(function(){ status(""); }); };
+$("#refresh").onclick = function(){
+  status("Refreshing\u2026");
+  load().then(function(){ if (!$("#status").classList.contains("err")) status(""); });
+};
 $("#save-settings").onclick = function(){
   localStorage.setItem("bl.name", $("#s-name").value.trim());
-  var tok = $("#s-token").value.trim();
-  if (tok) localStorage.setItem("bl.token", tok);
-  status("Settings saved.", "ok");
-  setTimeout(function(){ status(""); }, 2000);
-  load();
-};
-$("#clear-token").onclick = function(){
-  localStorage.removeItem("bl.token");
-  $("#s-token").value = "";
-  status("Token removed from this browser.", "ok");
+  status("Name saved.", "ok");
+  clearStatusSoon();
   render();
 };
 
 $("#s-name").value = getName();
-$("#s-token").value = getToken();
 render();
 load();
+
+/* Someone may be editing the sheet on their phone while this tab is open,
+   so pick up their changes when the tab comes back into focus. */
+document.addEventListener("visibilitychange", function(){
+  if (!document.hidden && !state.busy) load();
+});
 </script>
 </body>
 </html>
